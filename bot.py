@@ -1,56 +1,109 @@
-import os
 import requests
-from dotenv import load_dotenv
+from decimal import Decimal, getcontext
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Load environment variables
-load_dotenv()
-BOT_TOKEN = os.getenv("7201934999:AAGRDXyDTFmVDTu6U3MziCMxxy_R4ELmd4o")
-MANTA_RPC_URL = os.getenv("MANTA_RPC_URL", "https://pacific-rpc.manta.network/http")
+# 🔐 Your Telegram Bot Token here
+BOT_TOKEN = "Your bot token"
 
-async def get_manta_gas_price():
-    """Fetch current gas price from Manta Pacific network"""
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_gasPrice",
-        "params": [],
-        "id": 1
-    }
-    
-    try:
-        response = requests.post(MANTA_RPC_URL, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Convert hex gas price to gwei
-        gas_price_wei = int(data['result'], 16)
-        gas_price_gwei = gas_price_wei / 10**9
-        return gas_price_gwei
-    except Exception as e:
-        print(f"Error fetching gas price: {e}")
-        return None
+# Decimal precision
+getcontext().prec = 20
+
+# RPC endpoints for Manta Pacific
+RPC_ENDPOINTS = [
+    "https://manta-pacific.rpc.thirdweb.com",
+    "https://manta-pacific.blockpi.network/v1/rpc/public",
+    "https://1rpc.io/manta"
+]
+
+MAX_TX_COUNT = 50
+
+
+async def get_minimum_gwei_from_transactions():
+    """Fetch minimum gas price from latest 50 transactions (ignoring zero gas price)"""
+    for endpoint in RPC_ENDPOINTS:
+        try:
+            # Get latest block number
+            block_num_response = requests.post(
+                endpoint,
+                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                timeout=5,
+            )
+            latest_block = int(block_num_response.json()['result'], 16)
+
+            gas_prices = []
+            checked_blocks = 0
+
+            # Loop backward through blocks until 50 gas prices collected
+            while len(gas_prices) < MAX_TX_COUNT and latest_block - checked_blocks >= 0:
+                block_number = latest_block - checked_blocks
+
+                block_response = requests.post(
+                    endpoint,
+                    json={"jsonrpc": "2.0", "method": "eth_getBlockByNumber",
+                          "params": [hex(block_number), True], "id": 1},
+                    timeout=5,
+                )
+                block_data = block_response.json().get('result')
+
+                if block_data and block_data.get('transactions'):
+                    for tx in block_data['transactions']:
+                        if 'gasPrice' in tx:
+                            gas_price_wei = Decimal(int(tx['gasPrice'], 16))
+                            if gas_price_wei == 0:
+                                continue  # skip zero gas price tx
+                            gas_price_gwei = gas_price_wei / Decimal(10**9)
+                            gas_prices.append(gas_price_gwei)
+
+                            if len(gas_prices) >= MAX_TX_COUNT:
+                                break
+
+                checked_blocks += 1
+
+            if gas_prices:
+                return min(gas_prices)
+
+        except Exception as e:
+            print(f"[ERROR] RPC {endpoint} failed: {e}")
+            continue
+
+    return None
+
 
 async def gwei_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for the /gwei command"""
-    gas_price = await get_manta_gas_price()
-    if gas_price is not None:
-        message = f"⛽ Current Manta Pacific gas price: {gas_price:.2f} gwei"
+    await update.message.reply_text("🔍 Scanning latest 50 transactions for minimum gas price...")
+
+    min_gwei = await get_minimum_gwei_from_transactions()
+
+    if min_gwei is not None:
+        # Format with 10 decimals, preserving trailing zeros as needed
+        formatted_price = f"{min_gwei:.10f}"
+
+        message = (
+            f"⛽ Minimum Gas Price (10 decimals):\n"
+            f"┌─────────────────────────────┐\n"
+            f"│ {formatted_price.ljust(15)} Gwei │\n"
+            f"└─────────────────────────────┘\n\n"
+            f"📊 Based on latest 50 transactions\n"
+            f"🔢 10-decimal precision"
+        )
     else:
-        message = "⚠️ Could not fetch current gas price. Please try again later."
-    
+        message = "⚠️ Could not fetch gas data. All RPC endpoints failed."
+
     await update.message.reply_text(message)
 
+
 def main():
-    """Start the bot."""
-    # Create the Application
+    if not BOT_TOKEN:
+        print("❌ Error: BOT_TOKEN is not set.")
+        return
+
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add command handler
     application.add_handler(CommandHandler("gwei", gwei_command))
-    
-    # Run the bot until Ctrl-C is pressed
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    print("🤖 Manta Gas Tracker Bot is running...")
+    application.run_polling()
+
 
 if __name__ == '__main__':
     main()
